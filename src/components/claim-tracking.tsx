@@ -1,65 +1,17 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { AlertCircle, CalendarDays, CheckCircle2, Clock3, Download, FileText, LoaderCircle, MapPin, Search, ShieldCheck } from "lucide-react";
-import { supabase } from "@/lib/supabase/client";
+import type { TrackingResult } from "@/lib/types/portal";
+import { trackClaim, responseDownload } from "@/lib/services/portal";
+import { errorMessage } from "@/lib/errors";
+import { formatDate } from "@/lib/dates";
+import { useTurnstile } from "@/hooks/use-turnstile";
+import { ClaimCorrection } from "@/components/claim-correction";
 
-type PublicHistoryItem = { evento: string; fecha: string };
-type PublicResponse = {
-  asunto: string | null;
-  contenido: string | null;
-  conclusion: string | null;
-  fecha: string | null;
-  anexos: Array<{ id: string; nombre: string }>;
-} | null;
-type PublicObservation = { texto: string; plazo: string } | null;
-type TrackingResult = {
-  ok: boolean;
-  codigo: string;
-  fecha_registro: string;
-  asunto: string;
-  estado: string;
-  area: string;
-  historial: PublicHistoryItem[];
-  observacion: PublicObservation;
-  respuesta: PublicResponse;
-  mensaje?: string;
-};
-type PortalEnvelope = { ok?: boolean; data?: TrackingResult; error?: string; mensaje?: string };
-type DownloadEnvelope = { ok?: boolean; url?: string; expires_in?: number; nombre_archivo?: string; error?: string };
 type SignedDownload = { url: string; expiresAt: number };
-type TurnstileApi = {
-  render: (container: HTMLElement, options: {
-    sitekey: string;
-    action: string;
-    callback: (token: string) => void;
-    "expired-callback": () => void;
-    "error-callback": () => void;
-    theme?: "light";
-  }) => string;
-  reset: (widgetId?: string) => void;
-};
-
 const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
 const controlClass = "w-full rounded-xl border border-slate-300 bg-white px-3.5 py-3 text-sm text-slate-950 outline-none transition placeholder:text-slate-400 focus:border-blue-700 focus:ring-4 focus:ring-blue-100";
-
-function formatDate(value: string | null | undefined) {
-  if (!value) return "";
-  const [date, time] = value.split(" ");
-  const [year, month, day] = date.split("-");
-  return time ? `${day}/${month}/${year} · ${time}` : `${day}/${month}/${year}`;
-}
-
-function failureMessage(error: { message: string; context?: unknown }) {
-  const context = error.context;
-  if (context instanceof Response) {
-    if (context.status === 403) return "La verificación de seguridad no fue aceptada o venció. Vuelve a verificarte e inténtalo otra vez.";
-    if (context.status === 400) return "No se pudo procesar la solicitud. Revisa los datos e inténtalo nuevamente.";
-    if (context.status === 429) return "Se alcanzó el límite de intentos. Espera unos minutos antes de volver a consultar.";
-    return "El servicio de consulta no está disponible en este momento. Inténtalo más tarde.";
-  }
-  return "No fue posible conectar con el servicio. Revisa tu conexión e inténtalo nuevamente.";
-}
 
 export function ClaimTracking() {
   const [codigo, setCodigo] = useState("");
@@ -67,83 +19,15 @@ export function ClaimTracking() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<TrackingResult | null>(null);
   const [queryError, setQueryError] = useState("");
-  const [turnstileReady, setTurnstileReady] = useState(false);
-  const [turnstileError, setTurnstileError] = useState("");
-  const [tokenAvailable, setTokenAvailable] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState("");
   const [signedDownloads, setSignedDownloads] = useState<Record<string, SignedDownload>>({});
-  const containerRef = useRef<HTMLDivElement>(null);
-  const widgetId = useRef<string | null>(null);
-  const tokenRef = useRef("");
-  const waiters = useRef<Array<(token: string) => void>>([]);
-
-  const initializeTurnstile = useCallback(() => {
-    const turnstile = (window as Window & { turnstile?: TurnstileApi }).turnstile;
-    if (!siteKey || !containerRef.current || !turnstile || widgetId.current) return;
-    widgetId.current = turnstile.render(containerRef.current, {
-      sitekey: siteKey,
-      action: "portal-ciudadano",
-      callback: (token) => {
-        setTurnstileError("");
-        const waiter = waiters.current.shift();
-        if (waiter) {
-          waiter(token);
-          (window as Window & { turnstile?: TurnstileApi }).turnstile?.reset(widgetId.current ?? undefined);
-        } else {
-          tokenRef.current = token;
-          setTokenAvailable(true);
-        }
-      },
-      "expired-callback": () => {
-        tokenRef.current = "";
-        setTokenAvailable(false);
-        setTurnstileError("La verificación venció. Espera a que se renueve para continuar.");
-      },
-      "error-callback": () => {
-        tokenRef.current = "";
-        setTokenAvailable(false);
-        setTurnstileError("No se pudo completar Turnstile. Inténtalo nuevamente.");
-        waiters.current.splice(0).forEach((waiter) => waiter(""));
-      },
-      theme: "light",
-    });
-    setTurnstileReady(true);
-  }, []);
-
-  useEffect(() => {
-    const handleReady = () => initializeTurnstile();
-    const handleError = () => setTurnstileError("No se pudo cargar Cloudflare Turnstile. Recarga la página e inténtalo nuevamente.");
-    window.addEventListener("turnstile:ready", handleReady);
-    window.addEventListener("turnstile:error", handleError);
-    if ((window as Window & { turnstile?: TurnstileApi }).turnstile) window.setTimeout(handleReady, 0);
-    return () => {
-      window.removeEventListener("turnstile:ready", handleReady);
-      window.removeEventListener("turnstile:error", handleError);
-    };
-  }, [initializeTurnstile]);
-
-  const requestToken = useCallback(async () => {
-    const turnstile = (window as Window & { turnstile?: TurnstileApi }).turnstile;
-    if (tokenRef.current) {
-      const token = tokenRef.current;
-      tokenRef.current = "";
-      setTokenAvailable(false);
-      turnstile?.reset(widgetId.current ?? undefined);
-      return token;
-    }
-    return new Promise<string>((resolve, reject) => {
-      waiters.current.push((token) => {
-        if (token) resolve(token);
-        else reject(new Error("Turnstile no entregó un token."));
-      });
-    });
-  }, []);
+  const { containerRef, ready: turnstileReady, available: tokenAvailable, error: turnstileError, requestToken, reset } = useTurnstile();
 
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (loading) return;
-    const normalizedCode = codigo.trim();
+    const normalizedCode = codigo.trim().toUpperCase();
     const normalizedDni = dni.trim();
     if (!normalizedCode || !/^\d{8}$/.test(normalizedDni)) {
       setQueryError("Ingresa el código del reclamo y el DNI de 8 dígitos usado al registrarlo.");
@@ -152,36 +36,17 @@ export function ClaimTracking() {
     setLoading(true);
     setQueryError("");
     setResult(null);
-    dniForDownload.current = "";
+    setIdentityDni("");
     setDownloadError("");
     setSignedDownloads({});
     try {
       const turnstileToken = await requestToken();
-      const { data, error } = await supabase.functions.invoke<PortalEnvelope>("portal-ciudadano", {
-        body: {
-          accion: "consultar",
-          dni: normalizedDni,
-          codigo: normalizedCode,
-          turnstile_token: turnstileToken,
-        },
-      });
-      if (error) {
-        setQueryError(failureMessage(error));
-      } else if (!data?.ok || !data.data) {
-        setQueryError("El servicio devolvió una respuesta de consulta no válida.");
-      } else if (!data.data.ok) {
-        setQueryError(data.data.mensaje || "No se encontró el reclamo con los datos ingresados.");
-      } else {
-        setResult(data.data);
-        dniForDownload.current = normalizedDni;
-        setDni("");
-      }
+      const data = await trackClaim(normalizedDni, normalizedCode, turnstileToken);
+      setResult(data); setIdentityDni(normalizedDni); setDni("");
     } catch (error) {
-      setQueryError(error instanceof Error && error.message.startsWith("Turnstile")
-        ? "No se obtuvo una verificación de seguridad válida. Inténtalo nuevamente."
-        : "No se pudo completar la consulta. Inténtalo nuevamente.");
+      setQueryError(errorMessage(error));
     } finally {
-      setLoading(false);
+      setLoading(false); reset();
     }
   }
 
@@ -196,33 +61,16 @@ export function ClaimTracking() {
     });
     try {
       const turnstileToken = await requestToken();
-      const { data, error } = await supabase.functions.invoke<DownloadEnvelope>("anexos", {
-        body: {
-          accion: "descargar-respuesta",
-          dni: dniForDownload.current,
-          codigo: result.codigo,
-          anexo_id: anexoId,
-          turnstile_token: turnstileToken,
-        },
-      });
-      if (error) {
-        setDownloadError(failureMessage(error));
-      } else if (!data?.ok || !data.url) {
-        setDownloadError(data?.error || "No se pudo preparar la descarga del documento.");
-      } else {
-        setSignedDownloads((previous) => ({
-          ...previous,
-          [anexoId]: { url: data.url!, expiresAt: Date.now() + (data.expires_in ?? 300) * 1000 },
-        }));
-      }
+      const link = await responseDownload(identityDni, result.codigo, anexoId, turnstileToken);
+      setSignedDownloads((previous) => ({ ...previous, [anexoId]: link }));
     } catch {
       setDownloadError("No se pudo completar la verificación para descargar el documento.");
     } finally {
-      setDownloadBusy(null);
+      setDownloadBusy(null); reset();
     }
   }
 
-  const dniForDownload = useRef("");
+  const [identityDni, setIdentityDni] = useState("");
 
   return (
     <div className="space-y-6">
@@ -240,7 +88,7 @@ export function ClaimTracking() {
             <p className="mb-3 text-sm font-semibold text-slate-800">Verificación de seguridad *</p>
             <div ref={containerRef} className="min-h-[66px]" />
             {!turnstileReady && !turnstileError && <p className="text-xs text-slate-500">Cargando verificación…</p>}
-            {turnstileError && <p role="alert" className="mt-2 text-sm text-red-700">{turnstileError}</p>}
+            {turnstileError && <><p role="alert" className="mt-2 text-sm text-red-700">{turnstileError}</p><button type="button" onClick={reset} className="btn-secondary mt-2">Reintentar verificación</button></>}
           </> : <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">La verificación de seguridad no está configurada.</p>}
         </div>
         {queryError && <p role="alert" className="mt-5 flex gap-2 rounded-xl bg-red-50 p-4 text-sm text-red-800"><AlertCircle className="h-5 w-5 shrink-0" />{queryError}</p>}
@@ -250,6 +98,7 @@ export function ClaimTracking() {
         <p className="mt-4 flex items-center gap-2 text-xs text-slate-500"><ShieldCheck className="h-4 w-4" />El DNI y el código se usan para validar la consulta y no se guardan de forma persistente en el navegador.</p>
       </form>
 
+      {result?.observacion && <ClaimCorrection dni={identityDni} result={result} onCorrected={setResult} />}
       {result && <TrackingDetails
         result={result}
         onPrepareDownload={prepareDownload}

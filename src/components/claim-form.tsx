@@ -2,219 +2,50 @@
 
 import { FormEvent, InputHTMLAttributes, useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle2, FileText, LoaderCircle, ShieldCheck, Upload, X } from "lucide-react";
-import { supabase } from "@/lib/supabase/client";
-
-type CatalogItem = { id: number; nombre: string };
-type CatalogLimits = {
-  max_anexos: number;
-  max_anexo_bytes: number;
-  formatos: string[];
-  descripcion_min: number;
-  descripcion_max: number;
-  plazo_dias_habiles: number;
-};
-type CatalogData = {
-  areas: CatalogItem[];
-  categorias: CatalogItem[];
-  limites: CatalogLimits;
-};
-type PortalResponse = { ok?: boolean; data?: Record<string, unknown>; error?: string };
-type RegisteredAttachment = { id: string; nombre_archivo: string; storage_path: string };
-type Registration = {
-  id: string;
-  codigo: string;
-  fecha_registro: string;
-  estado: string;
-  anexos: RegisteredAttachment[];
-};
-type TurnstileApi = {
-  render: (container: HTMLElement, options: {
-    sitekey: string;
-    action: string;
-    callback: (token: string) => void;
-    "expired-callback": () => void;
-    "error-callback": () => void;
-    theme?: "light";
-  }) => string;
-  reset: (widgetId?: string) => void;
-};
-
-declare global {
-  interface Window {
-    turnstile?: TurnstileApi;
-  }
-}
+import type { CatalogItem, CatalogData, Registration } from "@/lib/types/portal";
+import { loadCatalog as fetchCatalog, registerClaim, uploadCitizenFile } from "@/lib/services/portal";
+import { errorMessage } from "@/lib/errors";
+import { limaDate } from "@/lib/dates";
+import { validateFiles } from "@/lib/validation/files";
+import { useTurnstile } from "@/hooks/use-turnstile";
+import { AttachmentRecovery } from "@/components/attachment-recovery";
 
 const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
-const allowedMimeByExtension: Record<string, string> = {
-  pdf: "application/pdf",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  png: "image/png",
-};
-
-function getFileExtension(name: string) {
-  return name.split(".").pop()?.toLowerCase() ?? "";
-}
-
-async function getFunctionError(error: { message: string; context?: unknown }) {
-  const context = error.context;
-  if (context instanceof Response) {
-    try {
-      const body = (await context.clone().json()) as { error?: unknown; details?: unknown };
-      if (typeof body.error === "string" && body.error.trim()) {
-        if (typeof body.details === "string") {
-          try {
-            const details = JSON.parse(body.details) as Record<string, unknown>;
-            const fieldErrors = Object.values(details).filter((value): value is string => typeof value === "string");
-            if (fieldErrors.length) return `${body.error} ${fieldErrors.join(" ")}`;
-          } catch {
-            return `${body.error} ${body.details}`;
-          }
-        }
-        return body.error;
-      }
-    } catch {
-      // Conserva el mensaje del SDK cuando el servidor no devuelve JSON.
-    }
-  }
-  return error.message || "No se pudo completar la solicitud.";
-}
-
 export function ClaimForm() {
   const [catalog, setCatalog] = useState<CatalogData | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [description, setDescription] = useState("");
-  const [turnstileToken, setTurnstileToken] = useState("");
-  const [turnstileReady, setTurnstileReady] = useState(false);
-  const [turnstileError, setTurnstileError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [registration, setRegistration] = useState<Registration | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [uploadErrors, setUploadErrors] = useState<string[]>([]);
-  const turnstileContainer = useRef<HTMLDivElement>(null);
-  const widgetId = useRef<string | null>(null);
-  const tokenRef = useRef("");
-  const tokenWaiters = useRef<Array<(token: string) => void>>([]);
-
+  const [citizenDni, setCitizenDni] = useState("");
+  const [uploadedIds, setUploadedIds] = useState<string[]>([]);
+  const { containerRef: turnstileContainer, ready: turnstileReady, available: turnstileToken, error: turnstileError, requestToken: requestTurnstileToken, reset } = useTurnstile(!registration);
+  const submitLock = useRef(false);
   const loadCatalog = useCallback(async () => {
-    setCatalogLoading(true);
-    setCatalogError("");
-    const { data, error } = await supabase.functions.invoke<PortalResponse>("portal-ciudadano", {
-      body: { accion: "catalogos" },
-    });
-    if (error) {
-      setCatalogError(await getFunctionError(error));
-      setCatalog(null);
-    } else if (!data?.ok || !data.data) {
-      setCatalogError(data?.error ?? "Supabase devolvió una respuesta de catálogos no válida.");
-      setCatalog(null);
-    } else {
-      const returned = data.data as unknown as CatalogData;
-      if (!Array.isArray(returned.areas) || !Array.isArray(returned.categorias) || !returned.limites) {
-        setCatalogError("La respuesta no contiene los catálogos y límites esperados.");
-        setCatalog(null);
-      } else {
-        setCatalog(returned);
-      }
-    }
-    setCatalogLoading(false);
+    setCatalogLoading(true); setCatalogError("");
+    try { setCatalog(await fetchCatalog()); } catch (error) { setCatalogError(errorMessage(error)); setCatalog(null); }
+    finally { setCatalogLoading(false); }
   }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => void loadCatalog(), 0);
-    return () => window.clearTimeout(timer);
-  }, [loadCatalog]);
-
-  const initializeTurnstile = useCallback(() => {
-    if (!siteKey || !turnstileContainer.current || !window.turnstile || widgetId.current) return;
-    widgetId.current = window.turnstile.render(turnstileContainer.current, {
-      sitekey: siteKey,
-      action: "portal-ciudadano",
-      callback: (token) => {
-        setTurnstileError("");
-        const waiter = tokenWaiters.current.shift();
-        if (waiter) {
-          waiter(token);
-          window.turnstile?.reset(widgetId.current ?? undefined);
-        } else {
-          tokenRef.current = token;
-          setTurnstileToken(token);
-        }
-      },
-      "expired-callback": () => {
-        tokenRef.current = "";
-        setTurnstileToken("");
-        setTurnstileError("La verificación venció. Espera una nueva verificación.");
-      },
-      "error-callback": () => {
-        tokenRef.current = "";
-        setTurnstileToken("");
-        setTurnstileError("No se pudo completar Turnstile. Recarga la verificación e inténtalo de nuevo.");
-        tokenWaiters.current.splice(0).forEach((waiter) => waiter(""));
-      },
-      theme: "light",
-    });
-    setTurnstileReady(true);
-  }, []);
-
-  useEffect(() => {
-    const handleReady = () => initializeTurnstile();
-    const handleError = () => setTurnstileError("No se pudo cargar el servicio de verificación de Cloudflare.");
-    window.addEventListener("turnstile:ready", handleReady);
-    window.addEventListener("turnstile:error", handleError);
-    if (window.turnstile) window.setTimeout(handleReady, 0);
-    return () => {
-      window.removeEventListener("turnstile:ready", handleReady);
-      window.removeEventListener("turnstile:error", handleError);
-    };
-  }, [initializeTurnstile]);
-
-  const requestTurnstileToken = useCallback(async () => {
-    if (tokenRef.current) {
-      const token = tokenRef.current;
-      tokenRef.current = "";
-      setTurnstileToken("");
-      window.turnstile?.reset(widgetId.current ?? undefined);
-      return token;
-    }
-    return new Promise<string>((resolve, reject) => {
-      tokenWaiters.current.push((token) => {
-        if (token) resolve(token);
-        else reject(new Error("Turnstile no generó un token válido. Inténtalo nuevamente."));
-      });
-    });
-  }, []);
+  useEffect(() => { const timer = window.setTimeout(() => void loadCatalog(), 0); return () => window.clearTimeout(timer); }, [loadCatalog]);
 
   function addFiles(fileList: FileList | null) {
     if (!fileList || !catalog) return;
     const incoming = Array.from(fileList);
     const all = [...selectedFiles, ...incoming];
-    if (all.length > catalog.limites.max_anexos) {
-      setSubmitError(`Puedes adjuntar hasta ${catalog.limites.max_anexos} archivos.`);
-      return;
-    }
-    for (const file of incoming) {
-      const extension = getFileExtension(file.name);
-      if (!catalog.limites.formatos.includes(extension) || allowedMimeByExtension[extension] !== file.type) {
-        setSubmitError(`${file.name}: formato no permitido. Adjunta PDF, JPG o PNG válidos.`);
-        return;
-      }
-      if (file.size < 1 || file.size > catalog.limites.max_anexo_bytes) {
-        setSubmitError(`${file.name}: el tamaño debe ser de 1 byte a ${formatBytes(catalog.limites.max_anexo_bytes)}.`);
-        return;
-      }
-    }
+    const fileError = validateFiles(all, catalog.limites);
+    if (fileError) { setSubmitError(fileError); return; }
     setSubmitError("");
     setSelectedFiles(all);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (submitting || registration || !catalog) return;
+    if (submitLock.current || submitting || registration || !catalog) return;
     setSubmitError("");
     const form = event.currentTarget;
     if (!form.reportValidity()) return;
@@ -259,18 +90,12 @@ export function ClaimForm() {
       acepta_declaracion: formData.get("acepta_declaracion") === "on",
     };
 
+    submitLock.current = true;
+    setCitizenDni(payload.ciudadano.numero_documento);
     setSubmitting(true);
     try {
       const token = await requestTurnstileToken();
-      const { data, error } = await supabase.functions.invoke<PortalResponse>("portal-ciudadano", {
-        body: { accion: "registrar", datos: payload, turnstile_token: token },
-      });
-      if (error) throw new Error(await getFunctionError(error));
-      if (!data?.ok || !data.data || typeof data.data.codigo !== "string") {
-        throw new Error(data?.error ?? "La función no confirmó el registro del reclamo.");
-      }
-
-      const created = data.data as unknown as Registration;
+      const created = await registerClaim(payload, token);
       if (selectedFiles.length > 0) {
         if (!Array.isArray(created.anexos) || created.anexos.length !== selectedFiles.length) {
           setUploadErrors(["El reclamo se registró, pero la respuesta no incluyó la metadata esperada de todos los anexos."]);
@@ -282,16 +107,8 @@ export function ClaimForm() {
           const attachment = created.anexos[index];
           try {
             const uploadToken = await requestTurnstileToken();
-            const body = new FormData();
-            body.append("accion", "subir");
-            body.append("dni", payload.ciudadano.numero_documento);
-            body.append("codigo", created.codigo);
-            body.append("anexo_id", attachment.id);
-            body.append("turnstile_token", uploadToken);
-            body.append("archivo", file, file.name);
-            const { data: uploadData, error: uploadError } = await supabase.functions.invoke<PortalResponse>("anexos", { body });
-            if (uploadError) throw new Error(await getFunctionError(uploadError));
-            if (!uploadData?.ok) throw new Error(uploadData?.error ?? "La función no confirmó la carga del archivo.");
+            await uploadCitizenFile(payload.ciudadano.numero_documento, created.codigo, attachment.id, file, uploadToken);
+            setUploadedIds((previous) => [...previous, attachment.id]);
             setUploadedFiles((previous) => [...previous, file.name]);
           } catch (error) {
             const message = error instanceof Error ? error.message : "Error desconocido al subir el archivo.";
@@ -303,7 +120,9 @@ export function ClaimForm() {
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "No se pudo registrar el reclamo.");
     } finally {
+      submitLock.current = false;
       setSubmitting(false);
+      reset();
     }
   }
 
@@ -319,6 +138,7 @@ export function ClaimForm() {
         <p className="mt-5 inline-flex rounded-xl bg-slate-100 px-4 py-3 font-mono text-xl font-bold tracking-wider text-slate-900">
           {registration.codigo}
         </p>
+        {uploadErrors.length > 0 && <AttachmentRecovery dni={citizenDni} codigo={registration.codigo} attachments={registration.anexos} files={selectedFiles} completedIds={uploadedIds} />}
         <p className="mt-4 text-sm text-slate-600">Estado informado por el sistema: {registration.estado}</p>
         {selectedFiles.length > 0 && (
           <div className={`mt-6 rounded-xl p-4 text-sm ${allFilesUploaded ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-900"}`}>
@@ -366,7 +186,7 @@ export function ClaimForm() {
             <SelectField label="Categoría *" name="categoria_id" required items={catalog?.categorias ?? []} loading={catalogLoading} />
             <SelectField label="Área orientativa" name="area_orientativa_id" items={catalog?.areas ?? []} loading={catalogLoading} optionalLabel="Sin preferencia" />
             <Field label="Subcategoría" name="subcategoria" />
-            <Field label="Fecha de los hechos" name="fecha_hechos" type="date" max={new Date().toISOString().slice(0, 10)} />
+            <Field label="Fecha de los hechos" name="fecha_hechos" type="date" max={limaDate()} />
             <Field label="Lugar de los hechos *" name="lugar" required className="sm:col-span-2" />
             <div className="sm:col-span-2">
               <label htmlFor="descripcion" className="mb-2 block text-sm font-semibold text-slate-800">Descripción *</label>
@@ -405,7 +225,7 @@ export function ClaimForm() {
               <p className="mb-3 text-sm font-semibold text-slate-800">Verificación de seguridad *</p>
               <div ref={turnstileContainer} className="min-h-[66px]" />
               {!turnstileReady && !turnstileError && <p className="text-xs text-slate-500">Cargando verificación de Cloudflare…</p>}
-              {turnstileError && <p role="alert" className="mt-2 text-sm text-red-700">{turnstileError}</p>}
+              {turnstileError && <><p role="alert" className="mt-2 text-sm text-red-700">{turnstileError}</p><button type="button" onClick={reset} className="btn-secondary mt-2">Reintentar verificación</button></>}
             </> : <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">Falta configurar `NEXT_PUBLIC_TURNSTILE_SITE_KEY`; no se puede enviar el formulario con seguridad.</p>}
           </div>
           {submitError && <p role="alert" className="mt-5 rounded-xl bg-red-50 p-4 text-sm text-red-800">{submitError}</p>}

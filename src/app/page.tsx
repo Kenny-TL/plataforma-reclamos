@@ -1,4 +1,6 @@
-import { ArrowDown, FileCheck2, Landmark, Search, ShieldCheck } from "lucide-react";
+import Link from "next/link";
+import { AuthLanding } from "@/components/auth-landing";
+import { ArrowDown, FileCheck2, KeyRound, Landmark, Search, ShieldCheck } from "lucide-react";
 import { ClaimForm } from "@/components/claim-form";
 import { ClaimTracking } from "@/components/claim-tracking";
 import { TurnstileLoader } from "@/components/turnstile-loader";
@@ -7,6 +9,7 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-slate-50">
       <TurnstileLoader />
+      <AuthLanding />
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center gap-3 px-5 py-4 sm:px-8">
           <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-900 text-white"><Landmark className="h-6 w-6" /></div>
@@ -18,6 +21,9 @@ export default function Home() {
             <a href="#registro" className="hover:text-blue-800">Registrar reclamo</a>
             <a href="#seguimiento" className="hover:text-blue-800">Consultar reclamo</a>
           </nav>
+          <Link href="/login" className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-900 transition hover:bg-blue-100 sm:text-sm">
+            <KeyRound className="h-4 w-4" /> Personal municipal
+          </Link>
         </div>
       </header>
 

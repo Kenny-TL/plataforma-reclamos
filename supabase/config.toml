@@ -1,0 +1,14 @@
+# Agrega estas secciones a tu supabase/config.toml existente.
+# No reemplaces otras configuraciones del proyecto.
+
+[functions.portal-ciudadano]
+verify_jwt = false
+
+[functions.anexos]
+verify_jwt = false
+
+[functions.enviar-notificaciones]
+verify_jwt = false
+
+[functions.crear-personal]
+verify_jwt = true
